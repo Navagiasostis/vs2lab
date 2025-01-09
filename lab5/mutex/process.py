@@ -2,7 +2,8 @@ import logging
 import random
 import time
 
-from constMutex import ENTER, RELEASE, ALLOW, ACTIVE
+from context import lab_channel
+from constMutex import ENTER, RELEASE, ALLOW, ACTIVE, CALL, CALLBACK
 
 
 class Process:
@@ -37,15 +38,17 @@ class Process:
     """
 
     def __init__(self, chan):
-        self.channel = chan  # Create ref to actual channel
+        self.channel: lab_channel.Channel = chan  # Create ref to actual channel
         self.process_id = self.channel.join('proc')  # Find out who you are
         self.all_processes: list = []  # All procs in the proc group
         self.other_processes: list = []  # Needed to multicast to others
         self.queue = []  # The request queue list
         self.clock = 0  # The current logical clock
-        self.peer_name = 'unassigned'  # The original peer name
-        self.peer_type = 'unassigned'  # A flag indicating behavior pattern
+        self.peer_name = ''  # The original peer name
+        self.peer_type = ''  # A flag indicating behavior pattern
         self.logger = logging.getLogger("vs2lab.lab5.mutex.process.Process")
+        self.dead_processes = []
+        self.timeout_counter = 0
 
     def __mapid(self, id='-1'):
         # format channel member address
@@ -55,7 +58,6 @@ class Process:
 
     def __cleanup_queue(self):
         if len(self.queue) > 0:
-            # self.queue.sort(key = lambda tup: tup[0])
             self.queue.sort()
             # There should never be old ALLOW messages at the head of the queue
             while self.queue[0][2] == ALLOW:
@@ -64,14 +66,14 @@ class Process:
                     break
 
     def __request_to_enter(self):
-        self.clock = self.clock + 1  # Increment clock value
+        self.clock += 1  # Increment clock value
         request_msg = (self.clock, self.process_id, ENTER)
         self.queue.append(request_msg)  # Append request to queue
         self.__cleanup_queue()  # Sort the queue
         self.channel.send_to(self.other_processes, request_msg)  # Send request
 
     def __allow_to_enter(self, requester):
-        self.clock = self.clock + 1  # Increment clock value
+        self.clock += 1  # Increment clock value
         msg = (self.clock, self.process_id, ALLOW)
         self.channel.send_to([requester], msg)  # Permit other
 
@@ -82,7 +84,7 @@ class Process:
         # construct new queue from later ENTER requests (removing all ALLOWS)
         tmp = [r for r in self.queue[1:] if r[2] == ENTER]
         self.queue = tmp  # and copy to new queue
-        self.clock = self.clock + 1  # Increment clock value
+        self.clock += 1  # Increment clock value
         msg = (self.clock, self.process_id, RELEASE)
         # Multicast release notification
         self.channel.send_to(self.other_processes, msg)
@@ -95,6 +97,21 @@ class Process:
         all_have_answered = len(self.other_processes) == len(
             processes_with_later_message)
         return first_in_queue and all_have_answered
+    
+    def __handle_timeout(self):
+        if self.timeout_counter == 0:
+            self.dead_processes = self.other_processes.copy()
+            msg = (self.clock, self.process_id, CALL)
+            self.channel.send_to(self.other_processes, msg)
+            self.logger.info(f"A proccess failed")
+        
+        elif self.timeout_counter == 1:
+            self.logger.info(f"Removing: {self.dead_processes}")
+            for dead in self.dead_processes:
+                self.all_processes.remove(dead)
+                self.other_processes.remove(dead)
+        
+        self.timeout_counter += 1
 
     def __receive(self):
         # Pick up any message
@@ -103,20 +120,27 @@ class Process:
             msg = _receive[1]
 
             self.clock = max(self.clock, msg[0])  # Adjust clock value...
-            self.clock = self.clock + 1  # ...and increment
+            self.clock += 1  # ...and increment
 
             self.logger.debug("{} received {} from {}.".format(
                 self.__mapid(),
                 "ENTER" if msg[2] == ENTER
                 else "ALLOW" if msg[2] == ALLOW
+                else "CALL" if msg[2] == CALL
+                else "CALLBACK" if msg[2] == CALLBACK
                 else "RELEASE", self.__mapid(msg[1])))
 
             if msg[2] == ENTER:
-                self.queue.append(msg)  # Append an ENTER request
-                # and unconditionally allow (don't want to access CS oneself)
+                self.queue.append(msg)  # Append an ENTER request and allow all
                 self.__allow_to_enter(msg[1])
             elif msg[2] == ALLOW:
                 self.queue.append(msg)  # Append an ALLOW
+            elif msg[2] == CALL:
+                msg = (self.clock, self.process_id, CALLBACK)
+                self.channel.send_to([_receive[0]], msg)
+            elif msg[2] == CALLBACK:
+                if _receive[0] in self.dead_processes:
+                    self.dead_processes.remove(_receive[0])
             elif msg[2] == RELEASE:
                 # assure release requester indeed has access (his ENTER is first in queue)
                 assert self.queue[0][1] == msg[1] and self.queue[0][2] == ENTER, 'State error: inconsistent remote RELEASE'
@@ -124,12 +148,9 @@ class Process:
 
             self.__cleanup_queue()  # Finally sort and cleanup the queue
         else:
-            self.logger.info("{} timed out on RECEIVE. Local queue: {}".
-                             format(self.__mapid(),
-                                    list(map(lambda msg: (
-                                        'Clock '+str(msg[0]),
-                                        self.__mapid(msg[1]),
-                                        msg[2]), self.queue))))
+            self.logger.info("{} timed out on RECEIVE. Local queue: {}". format(self.__mapid(), list(map(lambda msg: ('Clock '+str(msg[0]), self.__mapid(msg[1]), msg[2]), self.queue))))
+            if len(self.queue) > 0:
+                self.__handle_timeout()
 
     def init(self, peer_name, peer_type):
         self.channel.bind(self.process_id)
@@ -149,6 +170,12 @@ class Process:
 
     def run(self):
         while True:
+            if self.timeout_counter > 1:
+                self.logger.info("Clear timeout")
+                self.queue.clear()
+                self.timeout_counter = 0
+                self.dead_processes.clear()
+        
             # Enter the critical section if
             # 1) there are more than one process left and
             # 2) this peer has active behavior and
@@ -161,7 +188,15 @@ class Process:
 
                 self.__request_to_enter()
                 while not self.__allowed_to_enter():
+                    if self.timeout_counter > 1:
+                        self.logger.info("Stop waiting for enter")
+                        break
+
                     self.__receive()
+
+                if self.timeout_counter > 0:
+                    self.logger.info("Reset main loop")
+                    continue
 
                 # Stay in CS for some time ...
                 sleep_time = random.randint(0, 2000)
