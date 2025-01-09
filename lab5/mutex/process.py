@@ -2,7 +2,7 @@ import logging
 import random
 import time
 
-from constMutex import ENTER, RELEASE, ALLOW, ACTIVE
+from constMutex import ENTER, RELEASE, ALLOW, ACTIVE, REMOVE
 
 
 class Process:
@@ -32,7 +32,7 @@ class Process:
 
     <Message>: (Timestamp, Process_ID, <Request_Type>)
 
-    <Request Type>: ENTER | ALLOW  | RELEASE
+    <Request Type>: ENTER | ALLOW  | RELEASE | REMOVE
 
     """
 
@@ -46,6 +46,8 @@ class Process:
         self.peer_name = 'unassigned'  # The original peer name
         self.peer_type = 'unassigned'  # A flag indicating behavior pattern
         self.logger = logging.getLogger("vs2lab.lab5.mutex.process.Process")
+        self.working_processes = []
+        self.timeout_count = 0
 
     def __mapid(self, id='-1'):
         # format channel member address
@@ -74,6 +76,22 @@ class Process:
         self.clock = self.clock + 1  # Increment clock value
         msg = (self.clock, self.process_id, ALLOW)
         self.channel.send_to([requester], msg)  # Permit other
+    
+    # BEGIN NEW
+    # Erhöcht die eigene clock und sendet Nachricht mit Prozess der entfernt werden soll
+    def __remove_failed_process(self, failed_process):
+        self.clock += 1
+        msg = (self.clock, failed_process, REMOVE)
+        self.channel.send_to(self.other_processes, msg)
+        self.logger.info("Broadcasting removal of failed process: {}".format(self.__mapid(failed_process)))
+
+        # Clean up local state
+        self.other_processes = [p for p in self.other_processes if p != failed_process]
+        self.queue = [item for item in self.queue if item[1] != failed_process]
+        self.logger.info("Removed failed process: {}".format(self.__mapid(failed_process)))
+
+    
+    # END NEW
 
     def __release(self):
         # need to be first in queue to issue a release
@@ -88,6 +106,9 @@ class Process:
         self.channel.send_to(self.other_processes, msg)
 
     def __allowed_to_enter(self):
+        #Check if queue is emtpy before allowing access
+        if not self.queue:
+            return False
         # See who has sent a message (the set will hold at most one element per sender)
         processes_with_later_message = set([req[1] for req in self.queue[1:]])
         # Access granted if this process is first in queue and all others have answered (logically) later
@@ -97,7 +118,6 @@ class Process:
         return first_in_queue and all_have_answered
 
     def __receive(self):
-        # Pick up any message
         _receive = self.channel.receive_from(self.other_processes, 3)
         if _receive:
             msg = _receive[1]
@@ -109,28 +129,69 @@ class Process:
                 self.__mapid(),
                 "ENTER" if msg[2] == ENTER
                 else "ALLOW" if msg[2] == ALLOW
+                else "REMOVE" if msg[2] == REMOVE
                 else "RELEASE", self.__mapid(msg[1])))
 
             if msg[2] == ENTER:
                 self.queue.append(msg)  # Append an ENTER request
-                # and unconditionally allow (don't want to access CS oneself)
                 self.__allow_to_enter(msg[1])
             elif msg[2] == ALLOW:
                 self.queue.append(msg)  # Append an ALLOW
             elif msg[2] == RELEASE:
-                # assure release requester indeed has access (his ENTER is first in queue)
-                assert self.queue[0][1] == msg[1] and self.queue[0][2] == ENTER, 'State error: inconsistent remote RELEASE'
+                assert self.queue[0][1] == msg[1] and self.queue[0][2] == ENTER, \
+                    'State error: inconsistent remote RELEASE'
                 del (self.queue[0])  # Just remove first message
+            # Added Remove for failed processes
+            elif msg[2] == REMOVE:
+                self.queue = [item for item in self.queue if item[1] != msg[1]]
+                if msg[1] in self.other_processes:
+                    self.other_processes.remove(msg[1])
+                self.logger.info("Removed failed process: {}".format(self.__mapid(msg[1])))
 
-            self.__cleanup_queue()  # Finally sort and cleanup the queue
+            self.__cleanup_queue()
         else:
-            self.logger.info("{} timed out on RECEIVE. Local queue: {}".
-                             format(self.__mapid(),
-                                    list(map(lambda msg: (
-                                        'Clock '+str(msg[0]),
-                                        self.__mapid(msg[1]),
-                                        msg[2]), self.queue))))
+            self.logger.info("{} timed out on RECEIVE. Local queue: {}".format(
+                self.__mapid(),
+                list(map(lambda msg: (
+                    'Clock ' + str(msg[0]),
+                    self.__mapid(msg[1]),
+                    msg[2]), self.queue))))
 
+            if len(self.queue) > 0 and self.timeout_count < len(self.queue) and self.queue[0][2] == '1' and self.queue[0][1] == self.process_id:
+                working_processes = [entry[1] for entry in self.queue if entry[2] == '2']
+                working_processes.append(self.process_id)
+                failed_process = ""
+
+                for process in self.all_processes:
+                    if process not in self.working_processes:
+                        failed_process = str(process)
+
+                self.logger.warning("Detected failure of process: {}".format(self.__mapid(failed_process)))
+                self.__remove_failed_process(failed_process)
+
+                if failed_process in self.other_processes:
+                    self.other_processes.remove(failed_process)
+
+                self.queue = [item for item in self.queue if item[1] != failed_process]
+                self.logger.info("Removed failed process: {}".format(self.__mapid(failed_process)))
+                self.__cleanup_queue()
+                self.timeout_count = 0
+            elif len(self.queue) > 0 and self.timeout_count < len(self.queue):
+                failed_process = self.queue[0][1]
+                self.logger.warning("Detected failure of process: {}".format(self.__mapid(failed_process)))
+                self.__remove_failed_process(failed_process)
+                self.clock = self.clock + 1
+
+                if failed_process in self.other_processes:
+                    self.other_processes.remove(failed_process)
+
+                self.queue = [item for item in self.queue if item[1] != failed_process]
+                self.logger.info("Removed failed process: {}".format(self.__mapid(failed_process)))
+                self.__cleanup_queue()
+                self.timeout_count = 0
+
+            self.timeout_count += 1
+            
     def init(self, peer_name, peer_type):
         self.channel.bind(self.process_id)
 
@@ -157,7 +218,7 @@ class Process:
                     self.peer_type == ACTIVE and \
                     random.choice([True, False]):
                 self.logger.debug("{} wants to ENTER CS at CLOCK {}."
-                                  .format(self.__mapid(), self.clock))
+                                    .format(self.__mapid(), self.clock))
 
                 self.__request_to_enter()
                 while not self.__allowed_to_enter():
@@ -166,7 +227,7 @@ class Process:
                 # Stay in CS for some time ...
                 sleep_time = random.randint(0, 2000)
                 self.logger.debug("{} enters CS for {} milliseconds."
-                                  .format(self.__mapid(), sleep_time))
+                                    .format(self.__mapid(), sleep_time))
                 print(" CS <- {}".format(self.__mapid()))
                 time.sleep(sleep_time/1000)
 
